@@ -1,0 +1,62 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "docker",
+      "request": "launch",
+      "name": "Docker: Launch Service",
+      "preLaunchTask": "docker-compose: up",
+      "dockerCompose": {
+        "service": "${input:serviceName}",
+        "file": "${workspaceFolder}/docker-compose.debug.yml"
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "serviceName",
+      "type": "promptString",
+      "description": "Enter the name of the Docker Compose service to debug"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "Run Enhanced BIOS Editor",
+      "type": "shell",
+      "command": "D:\\venv\\Scripts\\python.exe",
+      "args": [
+        "d:\\Bios Editor\\enhanced-bios-editor (1).py"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared"
+      }
+    }
+  ]
+}
+// You need to build and start your Docker Compose service before debugging. Here is a `tasks.json` to automate that step:
+// {
+//   "version": "2.0.0",
+//   "tasks": [
+//     {
+//       "label": "docker-compose: up",
+//       "type": "shell",
+//       "command": "docker-compose",
+//       "args": [
+//         "-f",
+//         "${workspaceFolder}/docker-compose.debug.yml",
+//         "up",
+//         "--build"
+//       ],
+//       "problemMatcher": []
+//     }
+//   ]
+// }
+// This task will build and start your Docker Compose services using the debug configuration before launching the debugger.
+// Debugging can be started in the [Debug View](command:workbench.view.debug) or by using the [Start Debugging Command](command:workbench.action.debug.run).
