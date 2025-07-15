@@ -1,5 +1,7 @@
 
 # MSI Hidden BIOS GUI
+<img width="1022" height="505" alt="image" src="https://github.com/user-attachments/assets/f0bfe5d4-47f6-446c-ac9f-9a9dc309b4dd" />
+
 
 ## Overview
 
