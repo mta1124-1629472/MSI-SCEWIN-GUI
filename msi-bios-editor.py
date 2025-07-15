@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Enhanced MSI BIOS Hidden Settings Editor
-- Integrated import/export functionality
+MSI SCEWIN GUI - Enhanced BIOS Settings Editor
+- Integrated import/export functionality with SCEWIN
 - Performance optimizations with lazy loading
 - Progress bars for long operations
 - Threading for non-blocking operations
@@ -17,11 +17,16 @@ import sys
 import shutil
 import threading
 import queue
+import gc
+import weakref
+import glob
 from datetime import datetime
 import time
 from collections import defaultdict
+from rapidfuzz import fuzz, process
 import webbrowser
 import tempfile
+from typing import Optional, List, Tuple, Union
 
 
 def run_as_admin():
@@ -40,20 +45,25 @@ run_as_admin()
 
 class BIOSSetting:
     """Represents a single BIOS setting with optimized structure"""
-    __slots__ = ("setup_question", "help_string", "token", "offset", "width", "bios_default", "options", "current_value", "is_numeric", "original_value", "original_has_options", "original_block_lines")
-    def __init__(self, setup_question="", help_string="", token="", offset="", 
-                 width="", bios_default="", options=None, current_value=None, is_numeric=False):
-        self.setup_question = setup_question
-        self.help_string = help_string
-        self.token = token
-        self.offset = offset
-        self.width = width
-        self.bios_default = bios_default
-        self.options = options or []
-        self.current_value = current_value or ""
-        self.is_numeric = is_numeric
-        self.original_has_options = False
-        self.original_block_lines = []
+    __slots__ = ("setup_question", "help_string", "token", "offset", "width", "bios_default", "options", "current_value", "is_numeric", "original_value", "original_has_options", "original_block_lines", "range_min", "range_max")
+    
+    def __init__(self, setup_question: str = "", help_string: str = "", token: str = "", offset: str = "", 
+                 width: str = "", bios_default: str = "", options: Optional[List[Tuple[str, str, bool]]] = None, 
+                 current_value: Optional[str] = None, is_numeric: bool = False):
+        self.setup_question: str = setup_question
+        self.help_string: str = help_string
+        self.token: str = token
+        self.offset: str = offset
+        self.width: str = width
+        self.bios_default: str = bios_default
+        self.options: List[Tuple[str, str, bool]] = options or []
+        self.current_value: str = current_value or ""
+        self.is_numeric: bool = is_numeric
+        self.original_value: str = ""
+        self.original_has_options: bool = False
+        self.original_block_lines: List[str] = []
+        self.range_min: Optional[int] = None
+        self.range_max: Optional[int] = None
 
 
 class ProgressDialog:
@@ -62,7 +72,7 @@ class ProgressDialog:
         self.parent = parent
         self.dialog = tk.Toplevel(parent)
         self.dialog.title(title)
-        self.dialog.geometry("400x150")
+        self.dialog.geometry("450x180")  # Increased height for better button spacing
         self.dialog.resizable(False, False)
         self.dialog.transient(parent)
         self.dialog.grab_set()
@@ -74,21 +84,21 @@ class ProgressDialog:
         main_frame = ttk.Frame(self.dialog, padding="20")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Message label
-        self.message_label = ttk.Label(main_frame, text=message, font=("Arial", 10))
+        # Message label with text wrapping
+        self.message_label = ttk.Label(main_frame, text=message, font=("Arial", 10), wraplength=400)
         self.message_label.pack(pady=(0, 15))
         
         # Progress bar
-        self.progress = ttk.Progressbar(main_frame, mode='determinate', length=350)
-        self.progress.pack(pady=(0, 10))
+        self.progress = ttk.Progressbar(main_frame, mode='determinate', length=380)
+        self.progress.pack(pady=(0, 15))
         
-        # Status label
-        self.status_label = ttk.Label(main_frame, text="Starting...", font=("Arial", 9))
-        self.status_label.pack()
+        # Status label with text wrapping
+        self.status_label = ttk.Label(main_frame, text="Starting...", font=("Arial", 9), wraplength=400)
+        self.status_label.pack(pady=(0, 15))
         
-        # Cancel button
-        self.cancel_button = ttk.Button(main_frame, text="Cancel", command=self.cancel)
-        self.cancel_button.pack(pady=(10, 0))
+        # Cancel button with proper sizing
+        self.cancel_button = ttk.Button(main_frame, text="Cancel", command=self.cancel, width=12)
+        self.cancel_button.pack(pady=(5, 0))
         
         self.cancelled = False
         self.dialog.protocol("WM_DELETE_WINDOW", self.cancel)
@@ -115,7 +125,7 @@ class ProgressDialog:
 
 
 class OptimizedNVRAMParser:
-    """High-performance NVRAM parser with progress tracking"""
+    """High-performance NVRAM parser with aggressive optimizations"""
     
     def __init__(self):
         self.settings = []
@@ -123,6 +133,13 @@ class OptimizedNVRAMParser:
         self.raw_header = ""
         self.categories = defaultdict(list)
         self._cancelled = False
+        
+        # Pre-compile regex patterns for better performance
+        self._setup_question_pattern = re.compile(r'Setup Question\s*=\s*(.+)', re.IGNORECASE)
+        self._token_pattern = re.compile(r'Token\s*=\s*([A-Fa-f0-9]+)', re.IGNORECASE)
+        self._help_pattern = re.compile(r'Help\s*=\s*(.+)', re.IGNORECASE)
+        self._range_pattern = re.compile(r'range[:=]?\s*(\d+)\s*[~\-]\s*(\d+)', re.IGNORECASE)
+        self._block_split_pattern = re.compile(r'\n(?=Setup Question\s*=)', re.IGNORECASE)
         
     def parse_file(self, file_path, progress_callback=None, cancel_flag=None):
         """Parse NVRAM file with optimized processing and progress updates"""
@@ -132,14 +149,17 @@ class OptimizedNVRAMParser:
         self._cancelled = False
         
         try:
-            # Read file with proper encoding handling
-            with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
+            if progress_callback:
+                progress_callback(5, "Reading file...")
+            
+            # Memory-efficient file reading with buffering
+            with open(file_path, 'r', encoding='utf-8', errors='replace', buffering=8192) as file:
                 content = file.read()
             
             if progress_callback:
-                progress_callback(10, "File loaded, parsing header...")
+                progress_callback(15, "Parsing header...")
             
-            # Extract and parse header
+            # Extract and parse header more efficiently
             header_end_pos = content.find("Setup Question")
             if header_end_pos > 0:
                 self.raw_header = content[:header_end_pos]
@@ -149,59 +169,172 @@ class OptimizedNVRAMParser:
                 return []
             
             if progress_callback:
-                progress_callback(20, "Splitting into setting blocks...")
+                progress_callback(25, "Splitting setting blocks...")
             
-            # Optimized block splitting using regex
+            # Optimized block splitting using pre-compiled regex
             setting_content = content[header_end_pos:] if header_end_pos > 0 else content
-            setting_blocks = re.split(r'\n(?=Setup Question\s*=)', setting_content)
+            setting_blocks = self._block_split_pattern.split(setting_content)
             
-            # Filter out empty blocks
-            setting_blocks = [block.strip() for block in setting_blocks if block.strip()]
+            # Filter out empty blocks and strip whitespace in one pass
+            setting_blocks = [block.strip() for block in setting_blocks if block.strip() and len(block.strip()) > 10]
             total_blocks = len(setting_blocks)
             
             if progress_callback:
-                progress_callback(30, f"Processing {total_blocks} settings...")
+                progress_callback(35, f"Processing {total_blocks} settings...")
             
-            # Process blocks with batch progress updates
-            batch_size = max(1, total_blocks // 50)  # Update progress every 2%
+            # Process blocks with optimized batch updates
+            batch_size = max(10, total_blocks // 20)  # Larger batches for better performance
+            processed_settings = []
             
             for i, block in enumerate(setting_blocks):
                 if cancel_flag and cancel_flag():
                     break
                 
-                setting = self._parse_setting_block(block)
+                setting = self._parse_setting_block_optimized(block)
                 if setting:
-                    self.settings.append(setting)
+                    processed_settings.append(setting)
                     
-                    # Categorize settings for faster filtering
-                    category = self._extract_category(setting.setup_question)
-                    self.categories[category].append(len(self.settings) - 1)
+                    # Batch categorization for better performance
+                    if len(processed_settings) % 100 == 0:  # Categorize in batches of 100
+                        self._batch_categorize(processed_settings[-100:])
                 
-                # Update progress in batches
+                # Update progress less frequently for better performance
                 if progress_callback and (i % batch_size == 0 or i == total_blocks - 1):
-                    progress_value = 30 + int((i + 1) / total_blocks * 60)
-                    status = f"Processed {i + 1} of {total_blocks} settings..."
+                    progress_value = 35 + int((i + 1) / total_blocks * 55)
+                    status = f"Processed {i + 1}/{total_blocks} settings"
                     progress_callback(progress_value, status)
             
+            # Final categorization of remaining settings
+            remaining = len(processed_settings) % 100
+            if remaining > 0:
+                self._batch_categorize(processed_settings[-remaining:])
+            
+            self.settings = processed_settings
+            
             if progress_callback:
-                progress_callback(95, "Finalizing...")
+                progress_callback(95, "Optimization complete...")
+            
+            # Force garbage collection to free memory
+            import gc
+            gc.collect()
             
             return self.settings
             
+        except MemoryError:
+            messagebox.showerror("Memory Error", "Not enough memory to process this file. Try closing other applications.")
+            return []
         except Exception as e:
             messagebox.showerror("Parsing Error", f"Failed to parse BIOS file:\n{e}")
-            return False
+            return []
     
-    def _extract_category(self, question):
-        """Extract category from setting question for organization"""
+    def _parse_setting_block_optimized(self, block):
+        """Highly optimized setting block parser with pre-compiled patterns"""
+        if not block or block.strip().startswith('//'):
+            return None
+        
+        # Save original block lines
+        block_lines = [line for line in block.split('\n') if line.strip()]
+        lines = [line.strip() for line in block_lines if not line.strip().startswith('//')]
+        
+        if not lines:
+            return None
+            
+        # Fast pattern matching using pre-compiled regex
+        setup_match = self._setup_question_pattern.search(lines[0])
+        if not setup_match:
+            return None
+            
+        setting = BIOSSetting()
+        setting.original_block_lines = block_lines
+        setting.setup_question = setup_match.group(1).strip()
+        
+        try:
+            # Optimized parsing using compiled patterns
+            for line in lines[1:]:
+                if line.startswith('Help String'):
+                    setting.help_string = self._extract_value_fast(line)
+                elif line.startswith('Token'):
+                    token_match = self._token_pattern.search(line)
+                    if token_match:
+                        setting.token = token_match.group(1)
+                elif line.startswith('Offset'):
+                    setting.offset = self._extract_value_fast(line)
+                elif line.startswith('Width'):
+                    setting.width = self._extract_value_fast(line)
+                elif line.startswith('BIOS Default'):
+                    setting.bios_default = self._extract_value_fast(line).strip('<>')
+                elif line.startswith('Value'):
+                    value_match = re.search(r'<([^>]+)>', line)
+                    setting.current_value = value_match.group(1) if value_match else self._extract_value_fast(line)
+                elif line.startswith('Options') or '[' in line:
+                    if not setting.options:
+                        setting.options = []
+                    self._process_option_line_fast(setting, line)
+            
+            # Fast numeric validation and range extraction
+            if setting.current_value and setting.current_value.isdigit():
+                setting.is_numeric = True
+                if setting.help_string:
+                    range_match = self._range_pattern.search(setting.help_string)
+                    if range_match:
+                        setting.range_min = int(range_match.group(1))
+                        setting.range_max = int(range_match.group(2))
+            
+            # Auto-generate Enabled/Disabled options for 0/1 values
+            if (setting.current_value in ('0', '1') and not setting.options and 
+                ('enable' in setting.setup_question.lower() or 'disable' in setting.setup_question.lower())):
+                setting.options = [('1', 'Enabled', setting.current_value == '1'), 
+                                 ('0', 'Disabled', setting.current_value == '0')]
+                setting.is_numeric = False
+            
+            return setting if setting.setup_question and setting.token else None
+            
+        except Exception:
+            return None
+    
+    def _extract_value_fast(self, line):
+        """Fast value extraction using string operations"""
+        if '=' not in line:
+            return ""
+        value = line.split('=', 1)[1].strip()
+        return value[1:-1] if value.startswith('<') and value.endswith('>') else value
+    
+    def _process_option_line_fast(self, setting, line):
+        """Fast option processing with minimal regex"""
+        try:
+            is_current = '*' in line
+            clean_line = line.replace('*', '', 1) if is_current else line
+            
+            # Fast bracket extraction
+            start = clean_line.find('[')
+            end = clean_line.find(']', start)
+            if start != -1 and end != -1:
+                value = clean_line[start+1:end].strip()
+                desc_start = end + 1
+                comment_pos = clean_line.find('//', desc_start)
+                description = clean_line[desc_start:comment_pos if comment_pos != -1 else len(clean_line)].strip()
+                
+                setting.options.append((value, description, is_current))
+                if is_current:
+                    setting.current_value = value
+        except Exception:
+            pass
+    
+    def _batch_categorize(self, settings_batch):
+        """Batch categorization for better performance"""
+        for setting in settings_batch:
+            category = self._extract_category_fast(setting.setup_question)
+            self.categories[category].append(len(self.settings) + len(settings_batch) - len(settings_batch) + settings_batch.index(setting))
+    
+    def _extract_category_fast(self, question):
+        """Fast category extraction using string operations"""
         if not question:
             return "Other"
-        
-        # Extract first meaningful word as category
-        words = question.split()
-        if words:
-            return words[0]
-        return "Other"
+        # Get first word up to space or special character
+        for i, char in enumerate(question):
+            if char in ' :-_()[]':
+                return question[:i] if i > 0 else "Other"
+        return question[:15] if len(question) > 15 else question  # Limit category length
     
     def _parse_header(self, header_content):
         """Extract header information with error handling"""
@@ -246,6 +379,7 @@ class OptimizedNVRAMParser:
             value_val = None
             help_string = ""
             has_options = False
+            bios_default_found = False
             for line in lines[1:]:
                 if line.startswith('Help String'):
                     help_string = self._extract_value(line)
@@ -258,7 +392,14 @@ class OptimizedNVRAMParser:
                 elif line.startswith('Width'):
                     setting.width = self._extract_value(line)
                 elif line.startswith('BIOS Default'):
-                    setting.bios_default = self._extract_value(line)
+                    bios_default_value = self._extract_value(line)
+                    # Handle different formats: "BIOS Default = <value>" or "BIOS Default = value"
+                    if bios_default_value:
+                        # Remove angle brackets if present
+                        if bios_default_value.startswith('<') and bios_default_value.endswith('>'):
+                            bios_default_value = bios_default_value[1:-1]
+                        setting.bios_default = bios_default_value.strip()
+                        bios_default_found = True
                 elif line.startswith('Options') or (setting.options is not None and '[' in line):
                     if not setting.options:
                         setting.options = []
@@ -280,8 +421,8 @@ class OptimizedNVRAMParser:
                     v = int(value_val)
                     if v in (0, 1):
                         # Look for 'Enabled' and 'Disabled' in help string or comment
-                        if (('enabled' in help_string.lower() and 'disabled' in help_string.lower()) or
-                            ('enabled' in setting.setup_question.lower() and 'disabled' in setting.setup_question.lower())):
+                        if (("enabled" in help_string.lower() and "disabled" in help_string.lower()) or
+                            ("enabled" in setting.setup_question.lower() and "disabled" in setting.setup_question.lower())):
                             setting.options = [('1', 'Enabled', v == 1), ('0', 'Disabled', v == 0)]
                             setting.is_numeric = False
                             # Set current_value as string for consistency
@@ -301,6 +442,55 @@ class OptimizedNVRAMParser:
                         break
                 else:
                     setting.current_value = setting.options[0][0] if setting.options else ""
+
+
+            # --- Set bios_default by checking explicit BIOS Default line first, then help string ---
+            # Priority 1: Explicit "BIOS Default" line (if found)
+            if not bios_default_found and setting.help_string:
+                # Priority 2: Look for patterns in help string like "Default is X", "default: X", etc.
+                help_lower = setting.help_string.lower()
+                
+                # Try various patterns for default value specification
+                # Only match explicit default value specifications, not descriptive text
+                patterns = [
+                    r'default\s+is\s+([^\s,.;]+)',           # "Default is X"
+                    r'default\s*:\s*([^\s,.;]+)',            # "default: X" or "default:X"
+                    r'default\s*=\s*([^\s,.;]+)',            # "default = X" or "default=X"
+                    r'by\s+default\s*:\s*([^\s,.;]+)',       # "by default: X"
+                    r'by\s+default\s*=\s*([^\s,.;]+)',       # "by default = X"
+                    r'defaults\s+to\s+([^\s,.;]+)',          # "defaults to X"
+                ]
+                
+                for pattern in patterns:
+                    match = re.search(pattern, help_lower)
+                    if match:
+                        default_value = match.group(1).strip()
+                        # Clean up common suffixes that might be captured
+                        default_value = re.sub(r'[.,;]$', '', default_value)
+                        setting.bios_default = default_value
+                        break
+            
+            # If no explicit default found in either place, leave blank
+            if not hasattr(setting, 'bios_default') or not setting.bios_default:
+                setting.bios_default = ""
+
+            # Extract range information from help string if available
+            if setting.help_string:
+                # Try multiple patterns for range detection
+                range_patterns = [
+                    r'range[:=]?\s*(\d+)\s*[~\-]\s*(\d+)',                    # "range: 0 - 255" or "range 0~255"
+                    r'\(\s*(\d+)\s*[~\-]\s*(\d+)\s*\)',                       # "(0 ~ 255)" or "(0 - 255)"
+                    r'range\s+from\s+(\d+)[a-zA-Z]*\s*[~\-]\s*(\d+)[a-zA-Z]*', # "range from 100MHz ~ 140MHz"
+                    r'(\d+)\s*[~\-]\s*(\d+)',                                 # "0 ~ 255" or "0 - 255" (more general)
+                ]
+                
+                for pattern in range_patterns:
+                    range_match = re.search(pattern, setting.help_string.lower())
+                    if range_match:
+                        setting.range_min = int(range_match.group(1))
+                        setting.range_max = int(range_match.group(2))
+                        break
+
             # Validate required fields
             if not setting.setup_question or not setting.token:
                 return None
@@ -309,9 +499,13 @@ class OptimizedNVRAMParser:
             return None  # Skip malformed settings
     
     def _extract_value(self, line):
-        """Extract value after = sign"""
+        """Extract value after = sign, handling various formats"""
         if '=' in line:
-            return line.split('=', 1)[1].strip()
+            value = line.split('=', 1)[1].strip()
+            # Handle angle bracket format: <value>
+            if value.startswith('<') and value.endswith('>'):
+                return value[1:-1].strip()
+            return value
         return ""
     
     def _process_option_line(self, setting, line):
@@ -427,9 +621,17 @@ class EnhancedBIOSSettingsGUI:
                     errors.append(f"Setting '{setting.setup_question}': Exactly one option must be selected, found {star_count}.")
             # Validate value lines
             elif not getattr(setting, 'original_has_options', False):
-                # Try to infer allowed range from help string (e.g., 'range:0 ~ 31')
+                # Use new range fields if available, otherwise fall back to help string parsing
                 value = str(setting.current_value)
-                if hasattr(setting, 'help_string') and setting.help_string:
+                if hasattr(setting, 'range_min') and setting.range_min is not None and hasattr(setting, 'range_max') and setting.range_max is not None:
+                    try:
+                        v = int(value, 0)
+                        if not (setting.range_min <= v <= setting.range_max):
+                            errors.append(f"Setting '{setting.setup_question}': Value {v} is out of allowed range {setting.range_min}~{setting.range_max}.")
+                    except ValueError:
+                        errors.append(f"Setting '{setting.setup_question}': Value '{value}' is not a valid integer.")
+                elif hasattr(setting, 'help_string') and setting.help_string:
+                    # Fallback to old method for settings without parsed range
                     import re
                     m = re.search(r'range[:=]?\s*(\d+)\s*[~\-]\s*(\d+)', setting.help_string)
                     if m:
@@ -441,49 +643,7 @@ class EnhancedBIOSSettingsGUI:
                         except Exception:
                             errors.append(f"Setting '{setting.setup_question}': Value '{value}' is not a valid integer.")
         return errors
-    def on_inline_search_changed(self, *args):
-        """Handler for inline search box. Filters settings and displays results in main area. Now uses fuzzy matching if available."""
-        # Prevent error if scrollable_frame is not yet created
-        if not hasattr(self, 'scrollable_frame'):
-            return
-        search_text = self.inline_search_var.get().strip().lower()
-        # If search is empty, show normal paged view
-        if not search_text:
-            page = getattr(self, '_current_page', 0)
-            self.load_page_settings(page)
-            return
-        # Try to use rapidfuzz for fuzzy matching, else fallback to substring
-        try:
-            from rapidfuzz import fuzz
-            def fuzzy_score(s):
-                return max(
-                    fuzz.partial_ratio(search_text, str(s.setup_question).lower()),
-                    fuzz.partial_ratio(search_text, str(s.help_string).lower()),
-                    fuzz.partial_ratio(search_text, str(s.token).lower())
-                )
-            scored = [(i, setting, fuzzy_score(setting)) for i, setting in enumerate(self.settings)]
-            # Only keep those with score >= 60 (tune as needed)
-            filtered = [(i, s) for i, s, score in scored if score >= 60]
-            # Sort by best match
-            matched_settings = sorted(filtered, key=lambda x: -fuzzy_score(x[1]))
-        except ImportError:
-            # Fallback: substring match
-            matched_settings = []
-            for i, setting in enumerate(self.settings):
-                if (search_text in str(setting.setup_question).lower() or
-                    search_text in str(setting.help_string).lower() or
-                    search_text in str(setting.token).lower()):
-                    matched_settings.append((i, setting))
-        if not matched_settings:
-            # Clear display
-            for widget in self.scrollable_frame.winfo_children():
-                widget.destroy()
-            label = ttk.Label(self.scrollable_frame, text="No matches found.", font=("Arial", 12), foreground="gray")
-            label.pack(pady=40)
-            return
-        # Show first batch (20) with lazy loading
-        self.display_filtered_settings(matched_settings)
-
+    
     def scroll_and_highlight_setting(self, setting_index):
         """Scroll to and highlight the widget for the selected setting on the standard view, ensuring it is fully visible."""
         setting = self.settings[setting_index]
@@ -740,6 +900,11 @@ class EnhancedBIOSSettingsGUI:
         if not self.undo_stack:
             messagebox.showinfo("Undo", "Nothing to undo.")
             return
+            
+        # Check for invalid fields first
+        if not self.check_can_proceed("undo"):
+            return
+            
         # Save current state to redo stack
         if not hasattr(self, 'redo_stack'):
             self.redo_stack = []
@@ -758,6 +923,11 @@ class EnhancedBIOSSettingsGUI:
         if not hasattr(self, 'redo_stack') or not self.redo_stack:
             messagebox.showinfo("Redo", "Nothing to redo.")
             return
+            
+        # Check for invalid fields first
+        if not self.check_can_proceed("redo"):
+            return
+            
         # Save current state to undo stack
         current_snapshot = [(s.token, s.current_value) for s in self.settings]
         self.undo_stack.append(current_snapshot)
@@ -796,7 +966,7 @@ class EnhancedBIOSSettingsGUI:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("Enhanced MSI BIOS Hidden Settings Editor")
+        self.root.title("MSI SCEWIN GUI")
         self.root.geometry("1400x750")
         self.root.minsize(1000, 600)
         
@@ -809,14 +979,19 @@ class EnhancedBIOSSettingsGUI:
         self.current_progress = None
         self.undo_stack = []
         self.redo_stack = []
-        # Advanced optimization: cache for settings batches (for lazy loading)
-        self._settings_batch_cache = {}
-        # Advanced optimization: track last access for LRU purging
-        self._batch_access_times = {}
-        self._max_batches_in_memory = 5  # Tune as needed for memory/performance
+        
+        # Simple navigation state
+        self.current_page = 0
+        self.page_size = 25
+        self.filtered_settings = []  # Current filtered/searched settings
+        self.search_active = False
+        self.selected_category = ""
 
         # Track the most recently changed token for highlight in raw view
         self._last_changed_token = None
+        
+        # Track invalid fields to prevent other operations
+        self._invalid_fields = set()
 
         # Reduce memory footprint by limiting thread stack size (if needed)
         import threading
@@ -833,6 +1008,9 @@ class EnhancedBIOSSettingsGUI:
         
         # Check admin rights on startup
         self.check_admin_rights()
+        
+        # Apply performance optimizations
+        self.finalize_optimizations()
     
     def setup_styles(self):
         """Configure modern styling"""
@@ -846,14 +1024,24 @@ class EnhancedBIOSSettingsGUI:
         style.configure("Action.TButton", font=("Arial", 9, "bold"))
     
     def check_admin_rights(self):
-        """Check and prompt for admin rights"""
+        """Check and prompt for admin rights and SCEWIN availability"""
         try:
             is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
         except:
             is_admin = False
         
-        if not is_admin:
+        # Check SCEWIN availability
+        scewin_available, _ = self.check_scewin_availability()
+        
+        # Set appropriate status message
+        if not is_admin and not scewin_available:
+            self.status_var.set("⚠️ Admin rights recommended + SCEWIN not found")
+        elif not is_admin:
             self.status_var.set("⚠️ Admin rights recommended for BIOS operations")
+        elif not scewin_available:
+            self.status_var.set("⚠️ SCEWIN not found - Click 'Check SCEWIN Status' for details")
+        else:
+            self.status_var.set("✅ Ready - SCEWIN available and admin rights detected")
     
     def setup_gui(self):
         """Initialize the enhanced GUI with better layout"""
@@ -905,6 +1093,10 @@ class EnhancedBIOSSettingsGUI:
         restore_btn = ttk.Button(file_frame, text="🛡️ Restore Last Backup", command=self.restore_last_backup)
         restore_btn.pack(fill=tk.X, pady=(10, 0))
 
+        # SCEWIN status check button
+        status_btn = ttk.Button(file_frame, text="🔍 Check SCEWIN Status", command=self.show_scewin_status)
+        status_btn.pack(fill=tk.X, pady=(5, 0))
+
         # Undo/Redo buttons
         undo_btn = ttk.Button(file_frame, text="↩️ Undo", command=self.undo)
         undo_btn.pack(fill=tk.X, pady=(10, 0))
@@ -945,8 +1137,49 @@ class EnhancedBIOSSettingsGUI:
         clear_btn = ttk.Button(search_frame, text="Clear", command=lambda: self.inline_search_var.set(""))
         clear_btn.pack(fill=tk.X, pady=(0, 2))
 
+        # --- Fuzzy search toggle ---
+        fuzzy_frame = ttk.Frame(search_frame)
+        fuzzy_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        self.fuzzy_search_var = tk.BooleanVar()
+        self.fuzzy_search_var.set(False)  # Default to exact search
+        fuzzy_check = ttk.Checkbutton(fuzzy_frame, text="🔍 Fuzzy Search (finds similar matches)", 
+                                     variable=self.fuzzy_search_var,
+                                     command=self.on_fuzzy_search_toggled)
+        fuzzy_check.pack(anchor=tk.W)
+        
+        # Add tooltip-like help text
+        help_text = ttk.Label(fuzzy_frame, 
+                             text="💡 Fuzzy search finds settings even with typos or partial words", 
+                             font=("Arial", 8), foreground="gray")
+        help_text.pack(anchor=tk.W, pady=(2, 0))
+        
+        # Fuzzy search threshold slider
+        self.fuzzy_threshold_frame = ttk.Frame(search_frame)
+        self.fuzzy_threshold_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        ttk.Label(self.fuzzy_threshold_frame, text="Match Sensitivity:", font=("Arial", 8)).pack(anchor=tk.W)
+        self.fuzzy_threshold_var = tk.DoubleVar()
+        self.fuzzy_threshold_var.set(70.0)  # Default threshold
+        
+        threshold_scale = ttk.Scale(self.fuzzy_threshold_frame, from_=50.0, to=90.0, 
+                                   variable=self.fuzzy_threshold_var, orient=tk.HORIZONTAL,
+                                   command=self.on_fuzzy_threshold_changed)
+        threshold_scale.pack(fill=tk.X, pady=(2, 0))
+        
+        self.threshold_label = ttk.Label(self.fuzzy_threshold_frame, text="70% (Balanced)", 
+                                        font=("Arial", 8), foreground="blue")
+        self.threshold_label.pack(anchor=tk.W)
+        
+        # Initially hide fuzzy controls
+        self.fuzzy_threshold_frame.pack_forget()
+
     def save_and_import_bios_with_review(self):
         """Show change review dialog and validate before importing to BIOS."""
+        # Check for invalid fields first
+        if not self.check_can_proceed("BIOS import"):
+            return
+            
         # Save original values for review if not already present
         for s in self.settings:
             if not hasattr(s, 'original_value'):
@@ -1028,17 +1261,16 @@ class EnhancedBIOSSettingsGUI:
     # File operation methods with threading
     def export_bios_and_load(self):
         """Export BIOS settings and load them with progress tracking (user-writable temp dir)"""
-        possible_dirs = [
-            r"C:\\Program Files (x86)\\MSI\\MSI Center\\Lib\\SCEWIN\\5.05.01.0002",
-            r"C:\\Program Files\\MSI\\MSI Center\\Lib\\SCEWIN\\5.05.01.0002"
-        ]
-        scewin_dir = None
-        for d in possible_dirs:
-            if os.path.isfile(os.path.join(d, "SCEWIN_64.exe")):
-                scewin_dir = d
-                break
+        # Search for SCEWIN installation dynamically
+        scewin_dir = self._find_scewin_installation()
         if not scewin_dir:
-            messagebox.showerror("Missing SCEWIN_64.exe", "Could not find SCEWIN_64.exe in known MSI Center locations.")
+            # Show more helpful error with search locations
+            search_paths = self._get_scewin_search_paths()
+            error_msg = ("Could not find SCEWIN_64.exe in any MSI Center installation.\n\n"
+                        "Searched locations:\n" + "\n".join(f"• {path}" for path in search_paths) + 
+                        "\n\nPlease ensure MSI Center is properly installed, or manually copy "
+                        "SCEWIN_64.exe and related files to the application directory.")
+            messagebox.showerror("SCEWIN Not Found", error_msg)
             return
         temp_dir = os.path.join(tempfile.gettempdir(), "scewin_temp")
         os.makedirs(temp_dir, exist_ok=True)
@@ -1082,10 +1314,8 @@ class EnhancedBIOSSettingsGUI:
                         "Export Failed", "nvram.txt was not created. See log for details:\n" + log_content))
                     return
                 progress.update_progress(90, "Loading exported file...")
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Export Successful", "BIOS settings exported to nvram.txt.\n\nLog:\n" + log_content))
-                self.root.after(0, lambda: self.load_file(nvram_txt))
-                if progress: progress.close()
+                # Load the file directly - no popup needed since it auto-loads
+                self.root.after(0, lambda: self.load_file(nvram_txt, progress))
             except Exception as e:
                 if progress: progress.close()
                 self.root.after(0, lambda: messagebox.showerror("Export Error", str(e)))
@@ -1106,9 +1336,30 @@ class EnhancedBIOSSettingsGUI:
             "Do you want to proceed?"
         ):
             return
+        
+        # Ensure SCEWIN files are available in temp directory
         temp_dir = os.path.join(tempfile.gettempdir(), "scewin_temp")
         os.makedirs(temp_dir, exist_ok=True)
         scewin_exe = os.path.join(temp_dir, "SCEWIN_64.exe")
+        
+        # Check if SCEWIN files are already in temp directory, if not, copy them
+        if not os.path.isfile(scewin_exe):
+            scewin_dir = self._find_scewin_installation()
+            if not scewin_dir:
+                messagebox.showerror("SCEWIN Not Found", 
+                                   "SCEWIN files not found. Please run 'Export BIOS & Load' first "
+                                   "to copy the required files, or ensure MSI Center is properly installed.")
+                return
+            
+            # Copy required files to temp directory
+            files_to_copy = ["SCEWIN_64.exe", "amifldrv64.sys", "amigendrv64.sys"]
+            for fname in files_to_copy:
+                src = os.path.join(scewin_dir, fname)
+                dst = os.path.join(temp_dir, fname)
+                if not os.path.isfile(src):
+                    messagebox.showerror("Missing File", f"Required file not found: {src}")
+                    return
+                shutil.copy2(src, dst)
         nvram_txt = os.path.join(temp_dir, "nvram.txt")
         import_file = os.path.join(temp_dir, "nvram_import.txt")
         log_file = os.path.join(temp_dir, "log-file.txt")
@@ -1244,184 +1495,278 @@ class EnhancedBIOSSettingsGUI:
             # Remove page navigation, just update category menu
             self.update_category_menu()
             self.status_var.set(f"✅ Loaded {len(self.settings)} settings from {filename}")
-            # Show first batch of settings with lazy loading
-            self.display_lazy_loaded_settings()
+            # Show first page of settings
+            self.current_page = 0
+            self.search_active = False
+            self.filtered_settings = []
+            self.display_current_page()
             progress.close()
         except Exception as e:
             progress.close()
             messagebox.showerror("Interface Error", f"Failed to update interface: {str(e)}")
-    
-    def populate_navigation(self):
-        pass  # No longer needed for infinite scroll
-    def display_lazy_loaded_settings(self, batch_size=20, keep_widgets=60):
-        """Display settings with infinite/lazy loading as user scrolls. Only keep a limited number of widgets in memory."""
-        self._lazy_settings_offset = 0
-        self._lazy_batch_size = batch_size
-        self._lazy_keep_widgets = keep_widgets
-        self._lazy_loaded_indices = set()
-        # Clear current display
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-        self.setting_widgets.clear()
-        self._lazy_settings_total = len(self.settings)
-        self._lazy_settings_widgets = []
-        self._lazy_settings_frame = self.scrollable_frame
-        # Use self.canvas as the scrollable Canvas
-        self._lazy_settings_canvas = self.canvas
-        self._lazy_settings_canvas.bind('<Configure>', self._on_lazy_scroll)
-        self._lazy_settings_canvas.bind_all('<MouseWheel>', self._on_lazy_scroll)
-        self._lazy_settings_canvas.bind_all('<Button-4>', self._on_lazy_scroll)  # Linux scroll up
-        self._lazy_settings_canvas.bind_all('<Button-5>', self._on_lazy_scroll)  # Linux scroll down
-        self._lazy_settings_last_y = 0
-        self._lazy_settings_last_max = 0
-        self._lazy_settings_loading = False
-        self._lazy_settings_load_batch(0)
-
-    def _on_lazy_scroll(self, event=None):
-        # Check if near bottom, then load more
-        canvas = self._lazy_settings_canvas
-        try:
-            yview = canvas.yview()
-            if yview[1] > 0.95 and not self._lazy_settings_loading:
-                # Near bottom, load next batch
-                self._lazy_settings_loading = True
-                self._lazy_settings_load_batch(len(self._lazy_loaded_indices))
-                self._lazy_settings_loading = False
-        except Exception:
-            pass
-
-    def _lazy_settings_load_batch(self, start_index):
-        end_index = min(start_index + self._lazy_batch_size, self._lazy_settings_total)
-        for i in range(start_index, end_index):
-            if i not in self._lazy_loaded_indices:
-                self.create_setting_widget(self.settings[i], i)
-                self._lazy_loaded_indices.add(i)
-        # Remove widgets far above current scroll for memory
-        if len(self._lazy_loaded_indices) > self._lazy_keep_widgets:
-            min_index = min(self._lazy_loaded_indices)
-            max_index = max(self._lazy_loaded_indices)
-            to_remove = [idx for idx in self._lazy_loaded_indices if idx < max_index - self._lazy_keep_widgets]
-            for idx in to_remove:
-                widget = self.setting_widgets.get(self.settings[idx].token)
-                if widget:
-                    widget.master.destroy()
-                self._lazy_loaded_indices.remove(idx)
-                self.setting_widgets.pop(self.settings[idx].token, None)
 
     def update_category_menu(self):
-        """Replace category pills with a searchable dropdown (combobox) for categories, sorted by frequency."""
+        """Create simple category filter using top keywords"""
         if not hasattr(self, 'category_menu_frame') or not self.settings:
             return
         for widget in self.category_menu_frame.winfo_children():
             widget.destroy()
 
+        # Extract common keywords from settings
         from collections import Counter
-        stopwords = set([
-            'the', 'and', 'or', 'to', 'of', 'in', 'for', 'on', 'with', 'by', 'is', 'at', 'as', 'an', 'be', 'are',
-            'from', 'this', 'that', 'it', 'if', 'not', 'can', 'will', 'a', 'but', 'was', 'has', 'have', 'may', 'all',
-            'help', 'string', 'text', 'value', 'option', 'set', 'setting', 'settings', 'default', 'enable', 'disable',
-            'yes', 'no', 'auto', 'user', 'system', 'mode', 'type', 'select', 'use', 'change', 'current', 'bios', 'token',
-            'offset', 'width', 'page', 'number', 'data', 'field', 'bit', 'bits', 'description', 'desc', 'info', 'information',
-            'boot', 'save', 'import', 'export', 'file', 'load', 'backup', 'restore', 'undo', 'redo', 'option', 'options',
-            'nvram', 'msi', 'ami', 'center', 'utility', 'ver', 'copyright', 'reserved', 'crc32', 'script', 'name', 'created',
-            'do', 'not', 'change', 'line', 'move', 'desired', 'move', 'move', 'move', 'move', 'move', 'move', 'move', 'move',
-        ])
         word_counter = Counter()
         for s in self.settings:
-            for text in (str(s.setup_question), str(s.help_string), str(s.token)):
-                words = re.findall(r'\b\w+\b', text.lower())
-                for w in words:
-                    if w not in stopwords and len(w) > 2:
-                        word_counter[w] += 1
-        sorted_words = [w for w, _ in word_counter.most_common()]
-        self._category_menu_state['words'] = sorted_words
-
-        # Create a combobox for categories
+            # Get words from question and help text
+            text = f"{s.setup_question} {s.help_string}".lower()
+            words = re.findall(r'\b[a-z]{3,}\b', text)  # 3+ letter words only
+            for word in words:
+                if word not in {'the', 'and', 'for', 'with', 'this', 'that', 'setting', 'option', 'value', 'default', 'enable', 'disable'}:
+                    word_counter[word] += 1
+        
+        # Get top 15 categories
+        top_categories = [word.title() for word, count in word_counter.most_common(15) if count >= 2]
+        
+        # Category selection
         self.category_var = tk.StringVar()
-        category_combo = ttk.Combobox(self.category_menu_frame, textvariable=self.category_var, values=[w.capitalize() for w in sorted_words], font=("Arial", 10))
-        category_combo.pack(fill=tk.X, padx=2, pady=2)
-        category_combo.set("")
-        category_combo.bind("<KeyRelease>", self._on_category_combo_typed)
-        category_combo.bind("<<ComboboxSelected>>", self._on_category_combo_selected)
+        category_frame = ttk.Frame(self.category_menu_frame)
+        category_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(category_frame, text="Category:", font=("Arial", 9, "bold")).pack(side=tk.LEFT)
+        category_combo = ttk.Combobox(category_frame, textvariable=self.category_var, 
+                                     values=["All"] + top_categories, state="readonly", width=20)
+        category_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        category_combo.set("All")
+        category_combo.bind("<<ComboboxSelected>>", self.on_category_filter_changed)
 
-    def _on_category_combo_selected(self, event=None):
-        val = self.category_var.get().strip()
-        if val:
-            self.inline_search_var.set(val)
+    def on_category_filter_changed(self, event=None):
+        """Apply category filter"""
+        category = self.category_var.get()
+        if category == "All":
+            self.selected_category = ""
+        else:
+            self.selected_category = category.lower()
+        self.apply_search_and_filters()
 
-    def _on_category_combo_typed(self, event=None):
-        # As user types, filter the dropdown list
-        val = self.category_var.get().strip().lower()
-        all_words = self._category_menu_state.get('words', [])
-        filtered = [w.capitalize() for w in all_words if val in w]
-        if event is not None and getattr(event, 'widget', None) is not None:
-            event.widget['values'] = filtered
-    
-    def validate_setting(self, setting, value):
-        """Validate setting value before saving"""
-        if setting.is_numeric:
-            try:
-                int(value)
-            except ValueError:
-                messagebox.showerror("Validation Error", f"Value for {setting.setup_question} must be numeric.")
-                return False
-        if setting.options and value not in setting.options:
-            messagebox.showerror("Validation Error", f"Value '{value}' not in allowed options for {setting.setup_question}.")
+    def on_inline_search_changed(self, *args):
+        """Handle search text changes with debouncing"""
+        # Cancel any pending search
+        if hasattr(self, '_search_timer'):
+            self.root.after_cancel(self._search_timer)
+        
+        # Schedule new search after short delay
+        self._search_timer = self.root.after(300, self.apply_search_and_filters)
+
+    def apply_search_and_filters(self):
+        """Apply search and category filters, then display results"""
+        search_text = self.inline_search_var.get().strip()
+        
+        # Clear placeholder text
+        if search_text == "Search BIOS settings...":
+            search_text = ""
+        
+        # Start with all settings
+        if not search_text and not self.selected_category:
+            # No filters - show all settings
+            self.search_active = False
+            self.filtered_settings = []
+            self.current_page = 0
+            self.display_current_page()
+            return
+        
+        # Apply filters
+        self.search_active = True
+        
+        if search_text and self.fuzzy_search_var.get():
+            # Use fuzzy search with scoring for better ranking
+            self.filtered_settings = self._get_fuzzy_search_results_with_scores(search_text)
+        else:
+            # Use exact search or category-only filtering
+            self.filtered_settings = []
+            
+            for i, setting in enumerate(self.settings):
+                matches = True
+                
+                # Category filter
+                if self.selected_category:
+                    setting_text = f"{setting.setup_question} {setting.help_string}".lower()
+                    if self.selected_category not in setting_text:
+                        matches = False
+                
+                # Search filter
+                if matches and search_text:
+                    search_lower = search_text.lower()
+                    searchable_text = f"{setting.setup_question} {setting.help_string} {setting.token}".lower()
+                    if search_lower not in searchable_text:
+                        matches = False
+                
+                if matches:
+                    self.filtered_settings.append((i, setting))
+        
+        # Reset to first page and display
+        self.current_page = 0
+        self.display_current_page()
+        
+        # Update status
+        if self.search_active:
+            search_mode = "fuzzy" if (search_text and self.fuzzy_search_var.get()) else "exact"
+            threshold_info = f" ({int(self.fuzzy_threshold_var.get())}% threshold)" if search_mode == "fuzzy" else ""
+            self.status_var.set(f"🔍 Found {len(self.filtered_settings)} matching settings ({search_mode} search{threshold_info})")
+        else:
+            filename = os.path.basename(getattr(self, 'original_file_path', 'Unknown'))
+            self.status_var.set(f"✅ Loaded {len(self.settings)} settings from {filename}")
+
+    def on_fuzzy_search_toggled(self):
+        """Toggle visibility of fuzzy search threshold controls"""
+        if self.fuzzy_search_var.get():
+            # Show fuzzy threshold controls
+            self.fuzzy_threshold_frame.pack(fill=tk.X, pady=(5, 0))
+        else:
+            # Hide fuzzy threshold controls
+            self.fuzzy_threshold_frame.pack_forget()
+
+        # Update search results if search is active
+        search_text = self.inline_search_var.get().strip()
+        if search_text and search_text != "Search BIOS settings...":
+            self.apply_search_and_filters()
+
+    def on_fuzzy_threshold_changed(self, value):
+        """Update threshold label and refresh search results if needed"""
+        threshold = float(value)
+
+        # Determine description based on threshold range
+        if threshold < 60:
+            description = "Very Loose"
+        elif threshold < 70:
+            description = "Loose"
+        elif threshold < 80:
+            description = "Balanced"
+        elif threshold < 85:
+            description = "Strict"
+        else:
+            description = "Very Strict"
+
+        # Update label
+        self.threshold_label.config(text=f"{int(threshold)}% ({description})")
+
+        # Update search results if search is active
+        search_text = self.inline_search_var.get().strip()
+        if search_text and search_text != "Search BIOS settings..." and self.fuzzy_search_var.get():
+            # Use debouncing to avoid too many updates
+            if hasattr(self, '_threshold_timer'):
+                self.root.after_cancel(self._threshold_timer)
+            self._threshold_timer = self.root.after(300, self.apply_search_and_filters)
+
+    def _get_fuzzy_search_results_with_scores(self, search_text):
+        """Perform fuzzy search on settings with RapidFuzz and return scored results"""
+        results = []
+        threshold = self.fuzzy_threshold_var.get()
+        search_lower = search_text.lower()
+
+        for i, setting in enumerate(self.settings):
+            # Skip if category filter doesn't match
+            if self.selected_category:
+                setting_text = f"{setting.setup_question} {setting.help_string}".lower()
+                if self.selected_category not in setting_text:
+                    continue
+
+            # Prepare searchable text
+            searchable_text = f"{setting.setup_question} {setting.help_string} {setting.token}".lower()
+
+            # Calculate fuzzy match score
+            score = fuzz.partial_ratio(search_lower, searchable_text)
+
+            # Add to results if score meets threshold
+            if score >= threshold:
+                results.append((i, setting, score))
+
+        # Sort by score (highest first)
+        results.sort(key=lambda x: x[2], reverse=True)
+
+        # Return in the format expected by the rest of the code (index, setting)
+        return [(i, setting) for i, setting, _ in results]
+
+    def add_pagination_controls(self, total_settings):
+        """Add simple, clear pagination controls"""
+        total_pages = (total_settings + self.page_size - 1) // self.page_size
+        
+        if total_pages <= 1:
+            return  # No pagination needed
+            
+        # Pagination frame
+        pagination_frame = ttk.Frame(self.scrollable_frame)
+        pagination_frame.pack(fill=tk.X, pady=20)
+        
+        # Center the pagination controls
+        center_frame = ttk.Frame(pagination_frame)
+        center_frame.pack(anchor=tk.CENTER)
+        
+        # Previous button
+        if self.current_page > 0:
+            prev_btn = ttk.Button(center_frame, text="← Previous", 
+                                 command=lambda: self.go_to_page(self.current_page - 1))
+            prev_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Page info
+        page_label = ttk.Label(center_frame, 
+                              text=f"Page {self.current_page + 1} of {total_pages} ({total_settings} settings)",
+                              font=("Arial", 10))
+        page_label.pack(side=tk.LEFT, padx=15)
+        
+        # Next button
+        if self.current_page < total_pages - 1:
+            next_btn = ttk.Button(center_frame, text="Next →", 
+                                 command=lambda: self.go_to_page(self.current_page + 1))
+            next_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Quick jump to first/last for large result sets
+        if total_pages > 5:
+            ttk.Separator(center_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
+            
+            if self.current_page > 2:
+                first_btn = ttk.Button(center_frame, text="First", 
+                                      command=lambda: self.go_to_page(0))
+                first_btn.pack(side=tk.LEFT, padx=5)
+            
+            if self.current_page < total_pages - 3:
+                last_btn = ttk.Button(center_frame, text="Last", 
+                                     command=lambda: self.go_to_page(total_pages - 1))
+                last_btn.pack(side=tk.LEFT, padx=5)
+
+    def go_to_page(self, page_num):
+        """Navigate to a specific page"""
+        self.current_page = page_num
+        self.display_current_page()
+        # Scroll to top of page
+        self.canvas.yview_moveto(0)
+
+    def check_can_proceed(self, operation_name="operation"):
+        """Check if operations can proceed (no invalid fields)"""
+        if self.has_invalid_fields():
+            messagebox.showwarning("Invalid Values", 
+                                 f"Cannot proceed with {operation_name}.\n\n"
+                                 "Please correct all invalid field values first.\n"
+                                 "Look for fields highlighted in red.")
             return False
         return True
-    
-    # Utility methods
-    def find_scetool_path(self):
-        """Locate MSI SCEWIN tools directory"""
-        # Try PATH first
-        scetool = shutil.which("SCEWIN.exe")
-        if scetool:
-            return scetool
-        # Try common MSI Center install location
-        possible_dirs = [
-            r"C:\Program Files (x86)\MSI\MSI Center\Lib\SCEWIN\5.05.01.0002",
-            r"C:\Program Files\MSI\MSI Center\Lib\SCEWIN\5.05.01.0002"
-        ]
-        for d in possible_dirs:
-            exe_path = os.path.join(d, "SCEWIN.exe")
-            if os.path.isfile(exe_path):
-                return exe_path
-        return None
-    
-    def run_scetool_with_progress(self, scetool_path, command, progress):
-        """Run SCEWIN tool with progress tracking"""
-        try:
-            # Check admin privileges
-            try:
-                is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-            except:
-                is_admin = False
-            
-            if not is_admin:
-                progress.update_progress(50, "Requesting administrator privileges...")
-                # Request elevation
-                result = ctypes.windll.shell32.ShellExecuteW(
-                    None, "runas", "cmd.exe", 
-                    f'/c cd /d "{scetool_path}" && {command}', 
-                    None, 1
-                )
-                return result > 32  # Success if > 32
-            else:
-                # Run directly
-                full_command = f'cd /d "{scetool_path}" && {command}'
-                result = subprocess.run(['cmd.exe', '/c', full_command], 
-                                      capture_output=True, text=True, timeout=60)
-                return result.returncode == 0
-                
-        except Exception as e:
-            progress.update_progress(0, f"Error: {str(e)}")
-            return False
+
+    def has_invalid_fields(self):
+        """Check if there are any fields with invalid values"""
+        invalid_count = len(getattr(self, '_invalid_fields', set()))
+        if invalid_count > 0:
+            # Update status bar to show invalid field count
+            self.status_var.set(f"⚠️ {invalid_count} invalid field(s) - Please correct before saving")
+        return invalid_count > 0
 
     def save_file_only(self):
         """Save to file without importing to BIOS"""
         if not self.settings:
             messagebox.showwarning("No Settings", "No settings loaded to save.")
             return
+            
+        # Check for invalid fields first
+        if not self.check_can_proceed("file save"):
+            return
+            
         file_path = filedialog.asksaveasfilename(
             title="Save NVRAM file",
             defaultextension=".txt",
@@ -1467,38 +1812,32 @@ class EnhancedBIOSSettingsGUI:
                 total_settings = len(self.settings)
                 for i, setting in enumerate(self.settings):
                     if progress_callback and i % 50 == 0:
-                        progress_callback(int(10 + 90 * i / total_settings), f"Writing setting {i+1}/{total_settings}")
+                        progress_callback(10 + int((i / total_settings) * 80), f"Writing setting {i+1} of {total_settings}...")
                     # Copy original block and only update * or value as needed
                     block_lines = list(setting.original_block_lines)
                     # Update * marker for options
                     if getattr(setting, 'original_has_options', False) and setting.options:
-                        # Remove all * markers
                         new_lines = []
                         for line in block_lines:
-                            # Remove * from options lines
-                            if re.match(r'\s*\*?\[', line.strip()):
-                                new_lines.append(re.sub(r'\*', '', line, count=1))
-                            elif re.match(r'Options\s*=\s*\*?\[', line.strip()):
-                                new_lines.append(re.sub(r'\*', '', line, count=1))
-                            else:
-                                new_lines.append(line)
-                        # Add * to the correct option
-                        for idx, (value, desc, _) in enumerate(setting.options):
-                            # Find the line for this option
-                            val_str = f'[{value}]'
-                            for j, l in enumerate(new_lines):
-                                if val_str in l:
-                                    # Add * if this is the current value
+                            updated_line = line
+                            # Remove existing * first
+                            if '*' in line:
+                                updated_line = line.replace('*', '', 1)
+                            # Check if this line matches current selection
+                            for value, desc, is_current in setting.options:
+                                line_lower = updated_line.lower()
+                                if f'[{value}]' in line_lower or (desc and desc.lower() in line_lower):
                                     if str(value) == str(setting.current_value):
-                                        # Insert * at the right place
-                                        new_lines[j] = re.sub(r'(Options\s*=\s*)?(\s*)', r'\1\2*', new_lines[j], count=1)
+                                        updated_line = '*' + updated_line
+                                    break
+                            new_lines.append(updated_line)
                         block_lines = new_lines
                     # Update value for value lines
                     elif not getattr(setting, 'original_has_options', False):
                         new_lines = []
                         for line in block_lines:
                             if line.strip().startswith('Value'):
-                                new_lines.append(re.sub(r'<[^>]*>', f'<{setting.current_value}>', line))
+                                new_lines.append(f"Value         = <{setting.current_value}>")
                             else:
                                 new_lines.append(line)
                         block_lines = new_lines
@@ -1514,45 +1853,89 @@ class EnhancedBIOSSettingsGUI:
             messagebox.showerror("File Generation Error", 
                                f"Failed to generate NVRAM file: {str(e)}")
             return False
-
-    def _display_settings_batch(self, matched_settings, start, batch_size=5):
-        end = min(start + batch_size, len(matched_settings), 20)
-        for i in range(start, end):
-            index, setting = matched_settings[i]
-            self.create_setting_widget(setting, index)
-        if end < min(len(matched_settings), 20):
-            # Schedule next batch
-            self.root.after(10, lambda: self._display_settings_batch(matched_settings, end, batch_size))
-        elif len(matched_settings) > 20:
-            # Add Load More button after first 20
-            load_more_btn = ttk.Button(
-                self.scrollable_frame,
-                text=f"Load {len(matched_settings) - 20} more matches...",
-                command=lambda: self.load_more_search_results(matched_settings[20:])
-            )
-            load_more_btn.pack(pady=10)
-
-    def _get_settings_batch(self, batch_key, settings_list, cache=True):
-        """Return a batch of settings, using LRU cache for large sets."""
-        import time
-        if not cache:
-            return settings_list
-        # LRU cache logic
-        now = time.time()
-        self._batch_access_times[batch_key] = now
-        # Purge old batches if over limit
-        if len(self._settings_batch_cache) > self._max_batches_in_memory:
-            # Remove least recently used
-            sorted_batches = sorted(self._batch_access_times.items(), key=lambda x: x[1])
-            for k, _ in sorted_batches[:-self._max_batches_in_memory]:
-                self._settings_batch_cache.pop(k, None)
-                self._batch_access_times.pop(k, None)
-        # Return from cache or store
-        if batch_key in self._settings_batch_cache:
-            return self._settings_batch_cache[batch_key]
-        self._settings_batch_cache[batch_key] = settings_list
-        return settings_list
     
+    def populate_navigation(self):
+        pass  # No longer needed for infinite scroll
+        
+    def display_current_page(self):
+        """Display the current page of settings"""
+        # Clear current display
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        self.setting_widgets.clear()
+        
+        # Get settings to display
+        if self.search_active and self.filtered_settings:
+            settings_to_show = self.filtered_settings
+        else:
+            settings_to_show = [(i, setting) for i, setting in enumerate(self.settings)]
+        
+        # Calculate page boundaries
+        start_idx = self.current_page * self.page_size
+        end_idx = min(start_idx + self.page_size, len(settings_to_show))
+        
+        if not settings_to_show:
+            # Show "no results" message
+            no_results_label = ttk.Label(
+                self.scrollable_frame,                text="No settings found matching your search criteria.",
+                font=("Arial", 12), 
+                foreground="gray"
+            )
+            no_results_label.pack(expand=True, pady=50)
+            return
+        
+        # Display settings for current page
+        for i in range(start_idx, end_idx):
+            setting_idx, setting = settings_to_show[i]
+            self.create_setting_widget(setting, setting_idx)
+        
+        # Add pagination controls at the bottom
+        self.add_pagination_controls(len(settings_to_show))
+        
+        # Add quick overview at top if filtering/searching
+        if self.search_active:
+            self.add_search_overview()
+
+    def add_search_overview(self):
+        """Add overview info for current search/filter results"""
+        overview_frame = ttk.Frame(self.scrollable_frame)
+        overview_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Create overview text
+        total_filtered = len(self.filtered_settings)
+        search_text = self.inline_search_var.get().strip()
+        category_text = self.selected_category
+        
+        overview_parts = []
+        if search_text and search_text != "Search BIOS settings...":
+            overview_parts.append(f"Search: '{search_text}'")
+        if category_text:
+            overview_parts.append(f"Category: {category_text.title()}")
+        
+        if overview_parts:
+            filter_text = " | ".join(overview_parts)
+            overview_label = ttk.Label(overview_frame, 
+                                     text=f"🔍 Filtering by: {filter_text} | {total_filtered} results",
+                                     font=("Arial", 9, "italic"), 
+                                     foreground="blue")
+            overview_label.pack(side=tk.LEFT)
+            
+            # Clear filters button
+            clear_btn = ttk.Button(overview_frame, text="Clear Filters", 
+                                  command=self.clear_all_filters)
+            clear_btn.pack(side=tk.RIGHT)
+
+    def clear_all_filters(self):
+        """Clear all search and category filters"""
+        self.inline_search_var.set("")
+        if hasattr(self, 'category_var'):
+            self.category_var.set("All")
+        self.selected_category = ""
+        self.search_active = False
+        self.filtered_settings = []
+        self.current_page = 0
+        self.display_current_page()
+
     def on_category_changed(self, event=None):
         """Category filter removed: do nothing."""
         pass
@@ -1562,67 +1945,16 @@ class EnhancedBIOSSettingsGUI:
         pass
 
     def load_page_settings(self, page):
-        """Display a page of settings in the scrollable frame."""
-        page_size = 20
-        start = page * page_size
-        end = min(start + page_size, len(self.settings))
-        # Clear current display
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-        self.setting_widgets.clear()
-        for i in range(start, end):
-            self.create_setting_widget(self.settings[i], i)
-        # Track current page
-        self._current_page = page
+        """Navigate to a specific page - replaced by go_to_page"""
+        self.go_to_page(page)
     
-    def load_more_settings(self, category, start_index):
-        """Load more settings for a category, clearing unused widgets. Uses batch cache."""
-        if category in self.parser.categories:
-            batch = self._get_settings_batch(category, [(i, self.settings[i]) for i in self.parser.categories[category]], cache=True)
-
-            # Remove the "Load More" button
-            for widget in self.scrollable_frame.winfo_children():
-                if isinstance(widget, ttk.Button) and "Load" in widget.cget("text"):
-                    widget.destroy()
-                    break
-
-            # Load next batch
-            end_index = min(start_index + 20, len(batch))
-            for i, (setting_index, setting) in enumerate(batch[start_index:end_index]):
-                self.create_setting_widget(setting, setting_index)
-
-            # Add "Load More" button if there are still more settings
-            if end_index < len(batch):
-                load_more_btn = ttk.Button(
-                    self.scrollable_frame,
-                    text=f"Load {len(batch) - end_index} more settings...",
-                    command=lambda: self.load_more_settings(category, end_index)
-                )
-                load_more_btn.pack(pady=10)
-    
-    def load_more_search_results(self, remaining_settings, show_goto=False):
-        """Load more search results, clearing unused widgets. Supports Go to button."""
-        # Remove the "Load More" button
-        for widget in self.scrollable_frame.winfo_children():
-            if isinstance(widget, ttk.Button) and "Load" in widget.cget("text"):
-                widget.destroy()
-                break
-
-        # Load next batch of settings
-        for i, (index, setting) in enumerate(remaining_settings[:20]):
-            self.create_setting_widget(setting, index, show_goto=show_goto)
-
-        # Add "Load More" button if there are more settings
-        if len(remaining_settings) > 20:
-            load_more_btn = ttk.Button(
-                self.scrollable_frame,
-                text=f"Load {len(remaining_settings) - 20} more matches...",
-                command=lambda: self.load_more_search_results(remaining_settings[20:], show_goto=show_goto)
-            )
-            load_more_btn.pack(pady=10)
-    
-    def create_setting_widget(self, setting, index, show_goto=False):
+    def create_setting_widget(self, setting, index):
         """Create optimized widget for individual setting (memory and UI optimized)"""
+        # Use the new optimized widget creation method
+        return self._create_widget_with_validation(setting, self.scrollable_frame)
+    
+    def create_setting_widget_legacy(self, setting, index):
+        """Legacy widget creation method - kept for compatibility"""
         # Ignore/commented-out settings (leading //): do not allow configuration
         if str(setting.setup_question).strip().startswith("//") or str(setting.token).strip().startswith("//"):
             # Show as grayed-out, not editable
@@ -1632,13 +1964,22 @@ class EnhancedBIOSSettingsGUI:
                 padding=8
             )
             setting_frame.pack(fill=tk.X, padx=5, pady=3)
-            help_text = setting.help_string[:200] + ("..." if len(setting.help_string) > 200 else "") if setting.help_string else ""
-            if help_text.strip():
-                help_label = ttk.Label(setting_frame, text=help_text, foreground="gray", font=("Arial", 8))
-                help_label.pack(anchor=tk.W, pady=(0, 5))
-            tech_info = f"Token: {setting.token} | Offset: {setting.offset} | Default: {setting.bios_default}"
-            ttk.Label(setting_frame, text=tech_info, font=("Consolas", 7), foreground="gray").pack(anchor=tk.W, pady=(0, 5))
-            ttk.Label(setting_frame, text="This setting is ignored (commented out in BIOS file)", font=("Arial", 9, "italic"), foreground="gray").pack(anchor=tk.W, pady=(0, 5))
+            
+            # Help string with proper wrapping
+            if setting.help_string and setting.help_string.strip():
+                help_label = tk.Text(setting_frame, wrap=tk.WORD, height=3, font=("Arial", 8), 
+                                   foreground="gray", background="SystemButtonFace", 
+                                   borderwidth=0, highlightthickness=0, state=tk.DISABLED)
+                help_label.insert(tk.END, setting.help_string)
+                help_label.pack(fill=tk.X, pady=(0, 5))
+            
+            # Only show default value, no token/offset
+            if setting.bios_default:
+                default_info = f"Default: {setting.bios_default}"
+                ttk.Label(setting_frame, text=default_info, font=("Arial", 8), foreground="gray").pack(anchor=tk.W, pady=(0, 5))
+            
+            ttk.Label(setting_frame, text="This setting is ignored (commented out in BIOS file)", 
+                     font=("Arial", 9, "italic"), foreground="gray").pack(anchor=tk.W, pady=(0, 5))
             return
 
         # Use a lightweight frame for each setting
@@ -1649,25 +1990,31 @@ class EnhancedBIOSSettingsGUI:
         )
         setting_frame.pack(fill=tk.X, padx=5, pady=3)
 
-        # Only show help if not empty and not too long
-        if setting.help_string:
-            help_text = setting.help_string[:200] + ("..." if len(setting.help_string) > 200 else "")
-            if help_text.strip():
-                help_label = ttk.Label(setting_frame, text=help_text, 
-                                      foreground="gray", font=("Arial", 8))
-                help_label.pack(anchor=tk.W, pady=(0, 5))
+        # Help string with proper wrapping - use Text widget for multiline display
+        if setting.help_string and setting.help_string.strip():
+            # Calculate height based on text length (rough estimate)
+            text_lines = len(setting.help_string) // 80 + setting.help_string.count('\n') + 1
+            height = min(max(2, text_lines), 6)  # Between 2 and 6 lines
+            
+            help_text = tk.Text(setting_frame, wrap=tk.WORD, height=height, font=("Arial", 8), 
+                               foreground="gray", background="SystemButtonFace", 
+                               borderwidth=0, highlightthickness=0, state=tk.NORMAL, cursor="arrow")
+            help_text.insert(tk.END, setting.help_string)
+            help_text.config(state=tk.DISABLED)  # Make read-only
+            help_text.pack(fill=tk.X, pady=(0, 5))
 
-        # Technical info in compact format
-        tech_info = f"Token: {setting.token} | Offset: {setting.offset} | Default: {setting.bios_default}"
-        ttk.Label(setting_frame, text=tech_info, font=("Consolas", 7), foreground="darkblue").pack(anchor=tk.W, pady=(0, 5))
+        # Show default info only (no token/offset or range - range shown next to input)
+        info_parts = []
+        if setting.bios_default:
+            info_parts.append(f"Default: {setting.bios_default}")
+        
+        if info_parts:
+            info_text = " | ".join(info_parts)
+            ttk.Label(setting_frame, text=info_text, font=("Arial", 8), foreground="darkblue").pack(anchor=tk.W, pady=(0, 5))
 
         # Value input section
         value_frame = ttk.Frame(setting_frame)
         value_frame.pack(fill=tk.X, pady=(5, 0))
-
-        # Add Go to button if requested
-        if show_goto:
-            ttk.Button(value_frame, text="Go to", command=lambda idx=index: self.goto_setting_in_main(idx)).pack(side=tk.RIGHT, padx=(8, 0))
 
         # Use a local function to minimize closure memory
         def push_and_refresh(s, val):
@@ -1683,6 +2030,58 @@ class EnhancedBIOSSettingsGUI:
             # Track the most recently changed token for highlight
             self._last_changed_token = s.token
 
+        # Validation function for numeric inputs with range checking
+        def validate_numeric_input(s, val, entry_widget):
+            """Validate numeric input against range constraints and enforce correction"""
+            field_id = id(entry_widget)
+            
+            if not val.strip():
+                # Allow empty values - reset style and remove from invalid set
+                entry_widget.config(style="TEntry")
+                self._invalid_fields.discard(field_id)
+                self.clear_invalid_field_status()
+                return True
+                
+            try:
+                num_val = int(val, 0)  # Support hex (0x) and decimal
+                if hasattr(s, 'range_min') and s.range_min is not None and hasattr(s, 'range_max') and s.range_max is not None:
+                    if not (s.range_min <= num_val <= s.range_max):
+                        # Mark field as invalid
+                        self._invalid_fields.add(field_id)
+                        self.update_invalid_field_status()
+                        # Show error and force correction
+                        messagebox.showerror("Invalid Value", 
+                                           f"Value {num_val} is out of range.\nAllowed range: {s.range_min} ~ {s.range_max}\n\nPlease enter a valid value before making other changes.")
+                        # Reset to previous valid value and keep focus
+                        entry_widget.delete(0, tk.END)
+                        entry_widget.insert(0, str(s.current_value))
+                        entry_widget.focus_set()
+                        entry_widget.selection_range(0, tk.END)
+                        # Briefly highlight the field in red
+                        entry_widget.config(background='#ffcccc')
+                        self.root.after(2000, lambda: entry_widget.config(background='white'))
+                        return False
+                # Valid value - reset style and remove from invalid set
+                entry_widget.config(style="TEntry")
+                self._invalid_fields.discard(field_id)
+                self.clear_invalid_field_status()
+                return True
+            except ValueError:
+                # Mark field as invalid
+                self._invalid_fields.add(field_id)
+                self.update_invalid_field_status()
+                # Show error and force correction
+                messagebox.showerror("Invalid Value", f"'{val}' is not a valid number.\n\nPlease enter a valid numeric value before making other changes.")
+                # Reset to previous valid value and keep focus
+                entry_widget.delete(0, tk.END)
+                entry_widget.insert(0, str(s.current_value))
+                entry_widget.focus_set()
+                entry_widget.selection_range(0, tk.END)
+                # Briefly highlight the field in red
+                entry_widget.config(background='#ffcccc')
+                self.root.after(2000, lambda: entry_widget.config(background='white'))
+                return False
+
         # --- Dropdown logic for numeric fields with options ---
         # If the setting has options (even if is_numeric), always use a dropdown if there are 2-10 options
         use_dropdown = False
@@ -1694,7 +2093,7 @@ class EnhancedBIOSSettingsGUI:
 
         if use_dropdown:
             # Use a dropdown (Combobox) for small option sets
-            values = [f"{value} : {desc[:50]}" + ("..." if len(desc) > 50 else "") if desc else str(value) for value, desc, _ in setting.options]
+            values = [f"{value} : {desc[:50]}" + ("..." if len(desc) > 50 else "") for value, desc, _ in setting.options]
             combo = ttk.Combobox(value_frame, values=values, state="readonly", width=60)
             # Set current value
             current_value = str(setting.current_value)
@@ -1710,28 +2109,90 @@ class EnhancedBIOSSettingsGUI:
             combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
             self.setting_widgets[setting.token] = combo
 
-            def on_combo_change(event=None, s=setting, c=combo):
-                sel = c.get()
-                # Extract value from "value : desc"
-                if ' : ' in sel:
-                    val = sel.split(' : ')[0].strip()
-                elif ' - ' in sel:
-                    val = sel.split(' - ')[0].strip()
-                else:
-                    val = sel.strip()
-                push_and_refresh(s, val)
-            combo.bind("<<ComboboxSelected>>", on_combo_change)
+            # Create option values list for event handler
+            option_vals = [value for value, _, _ in setting.options]
+
+            # Optimized event handler with proper scope
+            def on_combo_select_legacy(event=None):
+                try:
+                    idx = combo.current()
+                    if 0 <= idx < len(option_vals):
+                        old_value = setting.current_value
+                        setting.current_value = option_vals[idx]
+                        
+                        # Use the legacy push_and_refresh function if available
+                        if 'push_and_refresh' in locals():
+                            push_and_refresh(setting, option_vals[idx])
+                        else:
+                            # Fallback to undo system
+                            self.push_undo()
+                except Exception:
+                    pass
+            
+            combo.bind("<<ComboboxSelected>>", on_combo_select_legacy)
         elif setting.is_numeric:
-            # Only use free-entry numeric field if no options or too many options
-            entry = ttk.Entry(value_frame, width=30)
-            entry.insert(0, str(setting.current_value))
-            entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            self.setting_widgets[setting.token] = entry
-            ttk.Label(value_frame, text="(Numeric)", font=("Arial", 8), foreground="blue").pack(side=tk.LEFT, padx=(5, 0))
-            def on_entry_change(event=None, s=setting, e=entry):
-                push_and_refresh(s, e.get())
-            entry.bind('<FocusOut>', on_entry_change)
-            entry.bind('<Return>', on_entry_change)
+            # Check if this should be read-only (hex values without clear ranges/options)
+            current_val = str(setting.current_value).strip()
+            is_readonly_hex = False
+            
+            # Detect read-only hex values: all hex digits, no range, no options, no clear guidance
+            if (len(current_val) >= 4 and 
+                all(c in '0123456789ABCDEFabcdef' for c in current_val) and
+                not hasattr(setting, 'range_min') and
+                not setting.options and
+                not setting.help_string):
+                is_readonly_hex = True
+            
+            # Also check for values that are clearly system-managed (all same character)
+            if len(current_val) >= 4 and len(set(current_val.upper())) == 1 and current_val.upper()[0] in 'F0':
+                is_readonly_hex = True
+                
+            if is_readonly_hex:
+                # Create read-only field for hex values that shouldn't be changed
+                readonly_frame = ttk.Frame(value_frame)
+                readonly_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                
+                readonly_entry = ttk.Entry(readonly_frame, width=30, state="readonly")
+                readonly_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                readonly_entry.config(state="normal")
+                readonly_entry.insert(0, current_val)
+                readonly_entry.config(state="readonly")
+                self.setting_widgets[setting.token] = readonly_entry
+                
+                ttk.Label(value_frame, text="(Read-only hex value)", font=("Arial", 8), foreground="gray").pack(side=tk.LEFT, padx=(5, 0))
+            else:
+                # Only use free-entry numeric field if no options or too many options
+                entry = ttk.Entry(value_frame, width=30)
+                entry.insert(0, str(setting.current_value))
+                entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                self.setting_widgets[setting.token] = entry
+                
+                # Show range info in label if available
+                range_text = "Numeric"
+                if hasattr(setting, 'range_min') and setting.range_min is not None and hasattr(setting, 'range_max') and setting.range_max is not None:
+                    range_text = f"Range: {setting.range_min}-{setting.range_max}"
+                ttk.Label(value_frame, text=f"({range_text})", font=("Arial", 8), foreground="blue").pack(side=tk.LEFT, padx=(5, 0))
+                
+                def on_entry_change(event=None, s=setting, e=entry):
+                    val = e.get().strip()
+                    if not val:
+                        # Allow empty values
+                        push_and_refresh(s, val)
+                    elif validate_numeric_input(s, val, e):
+                        # Only update if validation passes
+                        push_and_refresh(s, val)
+                    # If validation fails, the validate_numeric_input function handles resetting the field
+                entry.bind('<FocusOut>', on_entry_change)
+                entry.bind('<Return>', on_entry_change)
+                
+                # Prevent Tab/Escape from leaving invalid fields
+                def on_key_press(event, s=setting, e=entry):
+                    if event.keysym in ('Tab', 'ISO_Left_Tab'):
+                        val = e.get().strip()
+                        if val and not validate_numeric_input(s, val, e):
+                            return "break"  # Prevent tab navigation
+                    return None
+                entry.bind('<KeyPress>', on_key_press)
         elif setting.options:
             # Non-numeric, but has options: use dropdown
             values = [f"{value} : {desc[:50]}" + ("..." if len(desc) > 50 else "") if desc else str(value) for value, desc, _ in setting.options]
@@ -1748,7 +2209,7 @@ class EnhancedBIOSSettingsGUI:
             combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
             self.setting_widgets[setting.token] = combo
 
-            def on_combo_change(event=None, s=setting, c=combo):
+            def on_combo_change_text(event=None, s=setting, c=combo):
                 sel = c.get()
                 if ' : ' in sel:
                     val = sel.split(' : ')[0].strip()
@@ -1757,7 +2218,7 @@ class EnhancedBIOSSettingsGUI:
                 else:
                     val = sel.strip()
                 push_and_refresh(s, val)
-            combo.bind("<<ComboboxSelected>>", on_combo_change)
+            combo.bind("<<ComboboxSelected>>", on_combo_change_text)
         else:
             # Fallback: free-entry field
             entry = ttk.Entry(value_frame, width=30)
@@ -1769,30 +2230,380 @@ class EnhancedBIOSSettingsGUI:
             entry.bind('<FocusOut>', on_entry_change)
             entry.bind('<Return>', on_entry_change)
 
-    def goto_setting_in_main(self, idx):
-        """Scroll to and highlight the setting at the given index in the main view."""
-        self.load_page_settings(idx // 20)
-        self.root.after(150, lambda: self.scroll_and_highlight_setting(idx))
+    def clear_invalid_field_status(self):
+        """Clear invalid field status and update status bar if no invalid fields remain"""
+        if not self.has_invalid_fields():
+            # Restore normal status if no invalid fields
+            if hasattr(self, 'settings') and self.settings:
+                filename = os.path.basename(getattr(self, 'original_file_path', 'Unknown'))
+                self.status_var.set(f"✅ Loaded {len(self.settings)} settings from {filename}")
+    
+    def update_invalid_field_status(self):
+        """Update status bar to reflect current invalid field count"""
+        self.has_invalid_fields()  # This will update the status bar
 
-    def display_filtered_settings(self, settings_list):
-        """Display filtered settings with lazy loading and Go to buttons"""
-        # Clear current display
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-        # Display first batch with Go to buttons
-        for i, (index, setting) in enumerate(settings_list[:20]):
-            self.create_setting_widget(setting, index, show_goto=True)
-        # Add "Load More" button if needed
-        if len(settings_list) > 20:
-            load_more_btn = ttk.Button(
-                self.scrollable_frame,
-                text=f"Load {len(settings_list) - 20} more settings...",
-                command=lambda: self.load_more_search_results(settings_list[20:], show_goto=True)
+    def _optimize_memory_usage(self):
+        """Optimize memory usage by cleaning up unused references"""
+        # Clean up old widget references
+        self._cleanup_widget_cache()
+        
+        # Limit undo stack size
+        max_undo = 20
+        if len(self.undo_stack) > max_undo:
+            self.undo_stack = self.undo_stack[-max_undo:]
+        
+        if hasattr(self, 'redo_stack') and len(self.redo_stack) > max_undo:
+            self.redo_stack = self.redo_stack[-max_undo:]
+        
+        # Force garbage collection
+        gc.collect()
+    
+    def _cleanup_widget_cache(self):
+        """Clean up widgets that are no longer visible"""
+        # Get currently visible setting tokens
+        visible_tokens = set()
+        if self.search_active and self.filtered_settings:
+            start_idx = self.current_page * self.page_size
+            end_idx = min(start_idx + self.page_size, len(self.filtered_settings))
+            for i in range(start_idx, end_idx):
+                _, setting = self.filtered_settings[i]
+                visible_tokens.add(setting.token)
+        else:
+            start_idx = self.current_page * self.page_size
+            end_idx = min(start_idx + self.page_size, len(self.settings))
+            for i in range(start_idx, end_idx):
+                setting = self.settings[i]
+                visible_tokens.add(setting.token)
+        
+        # Remove widgets for settings not currently visible
+        tokens_to_remove = []
+        for token in self.setting_widgets:
+            if token not in visible_tokens:
+                tokens_to_remove.append(token)
+        
+        for token in tokens_to_remove:
+            widget = self.setting_widgets.pop(token, None)
+            if widget:
+                try:
+                    widget.destroy()
+                except:
+                    pass
+    
+    def _create_widget_with_validation(self, setting, parent_frame):
+        """Create widget with optimized validation and memory management"""
+        widget_frame = ttk.Frame(parent_frame)
+        widget_frame.pack(fill=tk.X, padx=10, pady=2)
+        
+        # Setting label with truncation for performance
+        label_text = setting.setup_question
+        if len(label_text) > 80:
+            label_text = label_text[:77] + "..."
+        
+        setting_label = ttk.Label(widget_frame, text=label_text, font=("Arial", 9, "bold"))
+        setting_label.pack(anchor=tk.W, pady=(0, 2))
+        
+        # Help text with truncation
+        if setting.help_string:
+            help_text = setting.help_string
+            if len(help_text) > 200:
+                help_text = help_text[:197] + "..."
+            help_label = ttk.Label(widget_frame, text=help_text, font=("Arial", 8), 
+                                 foreground="gray", wraplength=400)
+            help_label.pack(anchor=tk.W, pady=(0, 5))
+        
+        # Create appropriate input widget
+        if setting.options:
+            widget = self._create_combobox_widget(setting, widget_frame)
+        else:
+            widget = self._create_entry_widget(setting, widget_frame)
+        
+        # Store weak reference to avoid memory leaks
+        self.setting_widgets[setting.token] = widget
+        return widget
+    def _create_combobox_widget(self, setting, parent):
+        """Create optimized combobox widget"""
+        combo_frame = ttk.Frame(parent)
+        combo_frame.pack(fill=tk.X, pady=2)
+        
+        # Optimize option display
+        option_values = []
+        option_display = []
+        current_idx = 0
+        
+        for i, (value, desc, is_current) in enumerate(setting.options):
+            option_values.append(value)
+            # Truncate long descriptions for performance
+            display_text = f"{desc} ({value})" if desc else value
+            if len(display_text) > 50:
+                display_text = display_text[:47] + "..."
+            option_display.append(display_text)
+            
+            if is_current or value == setting.current_value:
+                current_idx = i
+        
+        combo = ttk.Combobox(combo_frame, values=option_display, state="readonly", width=60)
+        combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        if current_idx < len(option_display):
+            combo.set(option_display[current_idx])
+        
+        # Optimized event handler with closure for option_values
+        def on_combo_select(event=None):
+            try:
+                idx = combo.current()
+                if 0 <= idx < len(option_values):
+                    old_value = setting.current_value
+                    setting.current_value = option_values[idx]
+                    
+                    # Update validation state
+                    self._update_validation_state(setting.token, True)
+                    
+                    # Push to undo stack only if value actually changed
+                    if old_value != setting.current_value:
+                        self.push_undo()
+            except Exception:
+                pass
+        
+        combo.bind("<<ComboboxSelected>>", on_combo_select)
+        return combo
+    
+    def _create_entry_widget(self, setting, parent):
+        """Create optimized entry widget with validation"""
+        entry_frame = ttk.Frame(parent)
+        entry_frame.pack(fill=tk.X, pady=2)
+        
+        entry = ttk.Entry(entry_frame, width=30)
+        entry.pack(side=tk.LEFT, padx=(0, 10))
+        entry.insert(0, str(setting.current_value))
+        
+        # Add range info if available
+        if hasattr(setting, 'range_min') and setting.range_min is not None:
+            range_label = ttk.Label(entry_frame, text=f"Range: {setting.range_min}-{setting.range_max}", 
+                                  font=("Arial", 8), foreground="blue")
+            range_label.pack(side=tk.LEFT)
+        
+        # Optimized validation with debouncing
+        validation_timer = None
+        
+        def validate_delayed():
+            nonlocal validation_timer
+            if validation_timer:
+                entry.after_cancel(validation_timer)
+            validation_timer = entry.after(500, lambda: self._validate_entry_value(setting, entry))
+        
+        def on_entry_change(event=None):
+            validate_delayed()
+            # Update current value immediately for responsiveness
+            setting.current_value = entry.get()
+        
+        entry.bind('<KeyRelease>', on_entry_change)
+        entry.bind('<FocusOut>', lambda e: self._validate_entry_value(setting, entry))
+        
+        return entry
+    
+    def _validate_entry_value(self, setting, entry):
+        """Fast entry validation with visual feedback"""
+        try:
+            value = entry.get().strip()
+            is_valid = True
+            
+            # Fast numeric validation
+            if setting.is_numeric or (hasattr(setting, 'range_min') and setting.range_min is not None):
+                try:
+                    num_value = int(value, 0)  # Support hex with 0x prefix
+                    if hasattr(setting, 'range_min') and setting.range_min is not None:
+                        is_valid = setting.range_min <= num_value <= setting.range_max
+                except ValueError:
+                    is_valid = False
+            
+            # Update visual state
+            if is_valid:
+                entry.configure(style="TEntry")
+                self._update_validation_state(setting.token, True)
+            else:
+                entry.configure(style="Invalid.TEntry")
+                self._update_validation_state(setting.token, False)
+            
+            setting.current_value = value
+            
+        except Exception:
+            self._update_validation_state(setting.token, False)
+    
+    def _update_validation_state(self, token, is_valid):
+        """Track validation state for memory efficiency"""
+        if not hasattr(self, '_invalid_fields'):
+            self._invalid_fields = set()
+        
+        if is_valid:
+            self._invalid_fields.discard(token)
+        else:
+            self._invalid_fields.add(token)
+        
+        # Update status bar efficiently
+        if len(self._invalid_fields) > 0:
+            self.status_var.set(f"⚠️ {len(self._invalid_fields)} invalid field(s)")
+        else:
+            # Restore normal status
+            if hasattr(self, 'original_file_path'):
+                filename = os.path.basename(self.original_file_path)
+                self.status_var.set(f"✅ Loaded {len(self.settings)} settings from {filename}")
+    
+    def finalize_optimizations(self):
+        """Apply final performance optimizations"""
+        # Set up TTK styles for validation
+        style = ttk.Style()
+        style.configure("Invalid.TEntry", fieldbackground="#ffcccc")
+        style.configure("Valid.TEntry", fieldbackground="#ffffff")
+        
+        # Configure memory management
+        self._setup_memory_management()
+        
+        # Optimize search patterns
+        self._setup_search_optimization()
+    
+    def _setup_memory_management(self):
+        """Setup automatic memory management"""
+        # Schedule periodic memory cleanup
+        def periodic_cleanup():
+            self._optimize_memory_usage()
+            # Schedule next cleanup in 30 seconds
+            self.root.after(30000, periodic_cleanup)
+        
+        # Start the cleanup cycle
+        self.root.after(30000, periodic_cleanup)
+    
+    def _setup_search_optimization(self):
+        """Setup search pattern compilation for better performance"""
+        if not hasattr(self, '_compiled_search_patterns'):
+            self._compiled_search_patterns = {}
+        
+        # Pre-compile common search patterns
+        common_terms = ['enable', 'disable', 'mode', 'speed', 'power', 'clock', 'memory', 'cpu', 'gpu']
+        for term in common_terms:
+            try:
+                self._compiled_search_patterns[term] = re.compile(re.escape(term), re.IGNORECASE)
+            except:
+                pass
+    
+    def optimize_display_performance(self):
+        """Call this method to apply all display optimizations"""
+        # Optimize memory usage
+        self._optimize_memory_usage()
+        
+        # Update validation states efficiently
+        if hasattr(self, '_invalid_fields'):
+            invalid_count = len(self._invalid_fields)
+            if invalid_count > 0:
+                self.status_var.set(f"⚠️ {invalid_count} invalid field(s) - Please correct before saving")
+        
+        # Force widget update
+        self.root.update_idletasks()
+
+    def check_scewin_availability(self):
+        """Check if SCEWIN is available and show status to user"""
+        scewin_dir = self._find_scewin_installation()
+        
+        if scewin_dir:
+            return True, f"SCEWIN found at: {scewin_dir}"
+        else:
+            search_paths = self._get_scewin_search_paths()
+            searched_info = "Searched locations:\n" + "\n".join(f"• {path}" for path in search_paths[:10])
+            if len(search_paths) > 10:
+                searched_info += f"\n• ... and {len(search_paths) - 10} more locations"
+            
+            return False, (
+                "SCEWIN not found in any standard MSI Center installation.\n\n"
+                f"{searched_info}\n\n"
+                "Solutions:\n"
+                "• Install or reinstall MSI Center\n"
+                "• Manually copy SCEWIN_64.exe and driver files to the application directory\n"
+                "• Check if MSI Center is installed in a custom location"
             )
-            load_more_btn.pack(pady=10)
+
+    def show_scewin_status(self):
+        """Show SCEWIN availability status to user"""
+        available, message = self.check_scewin_availability()
+        
+        if available:
+            messagebox.showinfo("SCEWIN Status", f"✅ SCEWIN Available\n\n{message}")
+        else:
+            messagebox.showwarning("SCEWIN Status", f"⚠️ SCEWIN Not Available\n\n{message}")
+
+    def _get_scewin_search_paths(self):
+        """Get list of potential SCEWIN installation paths to search"""
+        base_paths = [
+            r"C:\Program Files\MSI\MSI Center\Lib\SCEWIN",
+            r"C:\Program Files (x86)\MSI\MSI Center\Lib\SCEWIN",
+            r"C:\Program Files\MSI\MSI Center\SCEWIN",
+            r"C:\Program Files (x86)\MSI\MSI Center\SCEWIN",
+            # Legacy Dragon Center paths
+            r"C:\Program Files\MSI\Dragon Center\Lib\SCEWIN",
+            r"C:\Program Files (x86)\MSI\Dragon Center\Lib\SCEWIN",
+            # Alternative installation paths
+            r"C:\MSI\MSI Center\Lib\SCEWIN",
+            r"C:\MSI\Dragon Center\Lib\SCEWIN"
+        ]
+        
+        search_paths = []
+        
+        # Add base paths directly
+        search_paths.extend(base_paths)
+        
+        # For each base path, also search for version subdirectories
+        for base_path in base_paths:
+            if os.path.isdir(base_path):
+                try:
+                    # Look for version directories (e.g., 5.05.01.0002, 5.06.*, etc.)
+                    for item in os.listdir(base_path):
+                        item_path = os.path.join(base_path, item)
+                        if (os.path.isdir(item_path) and 
+                            re.match(r'^\d+\.\d+\.\d+\.\d+$', item)):  # Version pattern
+                            search_paths.append(item_path)
+                except (OSError, PermissionError):
+                    continue
+        
+        return search_paths
+
+    def _find_scewin_installation(self):
+        """Dynamically find SCEWIN installation directory"""
+        search_paths = self._get_scewin_search_paths()
+        
+        for path in search_paths:
+            if os.path.isfile(os.path.join(path, "SCEWIN_64.exe")):
+                # Verify all required files are present
+                required_files = ["SCEWIN_64.exe", "amifldrv64.sys", "amigendrv64.sys"]
+                all_files_present = True
+                
+                for filename in required_files:
+                    if not os.path.isfile(os.path.join(path, filename)):
+                        all_files_present = False
+                        break
+                
+                if all_files_present:
+                    return path
+                else:
+                    # Log missing files for debugging
+                    missing_files = [f for f in required_files 
+                                   if not os.path.isfile(os.path.join(path, f))]
+                    print(f"Found SCEWIN_64.exe at {path} but missing: {missing_files}")
+        
+        # If not found in standard locations, check current directory and common locations
+        fallback_paths = [
+            os.path.dirname(os.path.abspath(__file__)),  # Script directory
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "SCEWIN"),
+            r"C:\SCEWIN",
+            r"C:\Tools\SCEWIN"
+        ]
+        
+        for path in fallback_paths:
+            if os.path.isfile(os.path.join(path, "SCEWIN_64.exe")):
+                return path
+        
+        return None
+
 
 if __name__ == "__main__":
+    # Create main window and start application
     root = tk.Tk()
     app = EnhancedBIOSSettingsGUI(root)
     root.mainloop()
-

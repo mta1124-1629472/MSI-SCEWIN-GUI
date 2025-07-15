@@ -26,3 +26,5 @@ scewin_temp/
 # Ignore OS-specific files
 Thumbs.db
 .DS_Store
+
+test_fuzzy_search.py
