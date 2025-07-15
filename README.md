@@ -48,13 +48,15 @@ MSI SCEWIN GUI is a powerful tool designed to manage hidden BIOS settings on MSI
 ## Key Features in Detail
 
 ### 🔍 Fuzzy Search
+
 - **Smart Matching**: Find settings even with typos ("memery freq" → "Memory Frequency Control")
-- **Partial Words**: Use abbreviations ("usb config" → "USB Port Configuration") 
+- **Partial Words**: Use abbreviations ("usb config" → "USB Port Configuration")
 - **Adjustable Sensitivity**: 50-90% threshold slider for loose to strict matching
 - **Ranked Results**: Best matches appear first with relevance scoring
 - **Multi-field Search**: Searches setting names, descriptions, tokens, and option values
 
 ### 🛡️ Safety Features
+
 - **Change Review Dialog**: Preview all modifications before applying to BIOS
 - **Advanced Validation**: Range checking, option validation, and consistency checks
 - **Automatic Backups**: Timestamped backups created before each BIOS import
@@ -62,6 +64,7 @@ MSI SCEWIN GUI is a powerful tool designed to manage hidden BIOS settings on MSI
 - **Admin Rights Detection**: Warns when administrator privileges are needed
 
 ### ⚡ Performance
+
 - **Paginated Display**: Handle hundreds of settings without UI lag (25 settings per page)
 - **Memory Optimization**: Lazy loading and efficient widget management
 - **Debounced Search**: Intelligent delays prevent excessive processing during typing
@@ -70,18 +73,21 @@ MSI SCEWIN GUI is a powerful tool designed to manage hidden BIOS settings on MSI
 ## Usage
 
 ### Quick Start
+
 1. **Export BIOS Settings**: Click "🔽 Export BIOS & Load" to extract current BIOS settings
 2. **Search & Edit**: Use the fuzzy search to find settings, then modify values using dropdowns or text fields
 3. **Validate Changes**: Check for any red-highlighted invalid fields before proceeding
 4. **Review & Import**: Click "🔼 Save & Import to BIOS" to review changes and apply them to your system
 
 ### Fuzzy Search Tips
+
 - **Enable fuzzy search** with the checkbox for typo-tolerant matching
 - **Adjust sensitivity** using the slider (70% is recommended for balanced results)
 - **Use partial words** like "cpu power" to find "CPU Power Management"
 - **Combine with categories** for more precise filtering
 
 ### Safety Best Practices
+
 - **Always review changes** in the confirmation dialog before importing
 - **Keep backups** - the app automatically creates them, but manual backups are wise
 - **Test gradually** - make small changes first to ensure system stability
@@ -98,18 +104,22 @@ MSI SCEWIN GUI is a powerful tool designed to manage hidden BIOS settings on MSI
 ## Troubleshooting
 
 ### SCEWIN Not Found
+
 If you see "SCEWIN not found" errors:
+
 1. Ensure MSI Center is properly installed
 2. Check the installation paths in "Check SCEWIN Status"
 3. Try reinstalling MSI Center from the official website
 4. Manually copy SCEWIN files to the application directory if needed
 
 ### Permission Issues
+
 - Run the application as Administrator for full BIOS access
 - Some BIOS operations require elevated privileges
 - The app will warn you if admin rights are needed
 
 ### Invalid Field Errors
+
 - Red-highlighted fields indicate invalid values
 - Check ranges and allowed options for each setting
 - Correct all invalid fields before importing to BIOS
