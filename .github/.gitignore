@@ -1,0 +1,30 @@
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore temporary files
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Ignore log files
+*.log
+
+# Ignore NVRAM backups and temporary files
+nvram_backup_*.txt
+nvram.txt
+log-file.txt
+scewin_temp/
+
+# Ignore IDE-specific files
+.vscode/
+.idea/
+*.code-workspace
+
+# Ignore OS-specific files
+Thumbs.db
+.DS_Store
+
+test_fuzzy_search.py
